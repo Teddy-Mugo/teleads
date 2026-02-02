@@ -1,0 +1,35 @@
+# API
+fastapi
+uvicorn[standard]
+
+# Telegram
+telethon
+
+# Database
+sqlalchemy
+psycopg2-binary
+alembic
+
+# Auth & Security
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+
+# Background jobs
+celery
+redis
+
+# Config
+python-dotenv
+pydantic-settings
+
+# Utils
+tenacity
+orjson
+loguru
+
+# Async helpers
+httpx
+
+# Scheduling
+apscheduler
