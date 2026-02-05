@@ -32,6 +32,9 @@ class MessageVariator:
         """
         Main entry point.
         """
+        if random.random() < 0.2:
+            return text
+
         lines = self._split_lines(text)
 
         if self.shuffle_lines and len(lines) > 1:

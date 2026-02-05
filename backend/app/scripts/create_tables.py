@@ -1,5 +1,5 @@
 from app.core.db import engine, Base
-from app.models.models import *  # import ALL models
+from app.models.models import SubscriptionPlan
 
 def main():
     print("ENGINE URL:", engine.url)

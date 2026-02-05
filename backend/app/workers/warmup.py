@@ -1,105 +1,30 @@
-import asyncio
+from datetime import datetime, timezone, timedelta
 import random
-import datetime
 
-from telethon import functions, types
-from telethon.errors import FloodWaitError
-
-from app.core.db import SessionLocal
-from app.models.models import TelegramAccount, AccountHealthEvent
-from app.services.client import get_client_for_account
+from app.models.models import TelegramAccount
 
 
-async def perform_warmup_action(client, action):
-    dialogs = await client.get_dialogs(limit=10)
-    if not dialogs:
-        return
+def apply_warmup(account: TelegramAccount) -> None:
+    now = datetime.now(timezone.utc)
 
-    dialog = random.choice(dialogs)
+    if account.warmup_started_at is None:
+        account.warmup_started_at = now
+        account.warmup_day = 1
 
-    if action == "read":
-        await client.send_read_acknowledge(dialog)
+    days_elapsed = (now - account.warmup_started_at).days + 1
+    account.warmup_day = min(days_elapsed, 5)
 
-    elif action == "react":
-        msg = await client.get_messages(dialog, limit=1)
-        if msg:
-            await client(functions.messages.SendReactionRequest(
-                peer=dialog.entity,
-                msg_id=msg[0].id,
-                reaction=[types.ReactionEmoji(emoticon="👍")],
-            ))
+    if account.warmup_day <= 4:
+        low, high = {
+            1: (5, 8),
+            2: (10, 15),
+            3: (20, 25),
+            4: (30, 35),
+        }[account.warmup_day]
 
-    elif action == "send":
-        await client.send_message(dialog, "Nice 👍")
+        account.daily_message_limit = random.randint(low, high)
+        account.status = "warming"
 
-    elif action == "join":
-        # Example public group — replace with SAFE list
-        await client(functions.channels.JoinChannelRequest(
-            channel="https://t.me/telegram"
-        ))
-
-
-
-async def warmup_account(account: TelegramAccount):
-    db = SessionLocal()
-
-    try:
-        client = await get_client_for_account(account)
-
-        actions = WARMUP_PLAN.get(account.warmup_day, ["read"])
-
-        daily_actions = random.randint(1, len(actions) + 1)
-
-        for _ in range(daily_actions):
-            action = random.choice(actions)
-
-            try:
-                await perform_warmup_action(client, action)
-                await asyncio.sleep(random.randint(30, 120))
-
-            except FloodWaitError as e:
-                account.status = "paused"
-                db.add(AccountHealthEvent(
-                    account_id=account.id,
-                    event_type="floodwait",
-                    details=f"Warmup floodwait {e.seconds}s",
-                ))
-                db.commit()
-                return
-
-        # Advance warm-up
-        if account.warmup_day >= 5:
-            account.status = "active"
-            account.warmup_completed = True
-        else:
-            account.warmup_day += 1
-
-        db.commit()
-
-    finally:
-        db.close()
-
-
-
-async def warmup_loop():
-    while True:
-        db = SessionLocal()
-
-        try:
-            accounts = (
-                db.query(TelegramAccount)
-                .filter(
-                    TelegramAccount.status == "warming",
-                    TelegramAccount.warmup_completed == False,
-                )
-                .all()
-            )
-
-            for account in accounts:
-                await warmup_account(account)
-                await asyncio.sleep(random.randint(300, 900))  # long pause
-
-        finally:
-            db.close()
-
-        await asyncio.sleep(3600)  # run hourly
+    else:
+        account.daily_message_limit = 45
+        account.status = "active"

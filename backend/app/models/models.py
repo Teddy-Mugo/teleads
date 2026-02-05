@@ -1,10 +1,11 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, date
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -12,6 +13,7 @@ from sqlalchemy import (
     Text,
     BigInteger,
     Index,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -316,3 +318,46 @@ class TelegramAccountDailyUsage(Base):
     __table_args__ = (
         UniqueConstraint("telegram_account_id", "usage_date"),
     )
+
+
+
+# daily counters 
+
+class DailyCounter(Base):
+    __tablename__ = "daily_counters"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    account_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("telegram_accounts.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+    )
+
+    count = Column(Integer, default=0)
+    date = Column(Date, default=date.today)
+
+    account = relationship("TelegramAccount", back_populates="counter")
+
+    def reset_if_needed(self):
+        today = date.today()
+        if self.date != today:
+            self.date = today
+            self.count = 0
+
+
+# subscription plans
+
+class SubscriptionPlan(Base):
+    __tablename__ = "subscription_plans"
+
+    id = Column(UUID(as_uuid=True), primary_key=True)
+    name = Column(String, unique=True)
+
+    max_accounts = Column(Integer)
+    min_interval_seconds = Column(Integer)
+
+    daily_account_limit = Column(Integer)
+    group_cooldown_minutes = Column(Integer)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
