@@ -7,25 +7,46 @@ from sqlalchemy.orm import Session
 from telethon.errors import FloodWaitError, RPCError
 
 from app.core.db import SessionLocal
-from app.models.models import TelegramAccount, DailyCounter
+from app.models.models import (
+    Campaign,
+    TelegramAccount,
+    TelegramGroup,
+    MessageLog,
+    MarketList,
+    CampaignGroup,
+)
 from app.services.telegram.client import TelegramClientWrapper
-from app.workers.warmup import apply_warmup
-from app.services.campaigns.executor import get_next_campaign_target
 from app.services.campaigns.message_variator import MessageVariator
-from app.services.campaigns.rate_limiter import RateLimiter
-from app.core.redis import redis_client
+from app.services.pricing.enforcement import (
+    validate_campaign_against_plan,
+)
+from app.workers.warmup import apply_warmup
+from app.services.pricing.plans import get_plan
+from app.services.rate_limit.account_limiter import (
+    can_send_message,
+    record_message_sent,
+)
+from app.services.rate_limit.campaign_limiter import (
+    campaign_interval_passed,
+    record_campaign_send,
+)
 
 
-# -------------------------
-# Timing (human-like)
-# -------------------------
-MIN_DELAY = 60      # 1 min
-MAX_DELAY = 180     # 3 min
+MIN_DELAY = 45
+MAX_DELAY = 120
 
 
-async def worker_loop(account: TelegramAccount, db: Session):
-    logger.info(f"Starting worker for {account.phone_number}")
+# --------------------------------------------------
+# Single-account send
+# --------------------------------------------------
 
+async def send_with_account(
+    *,
+    account: TelegramAccount,
+    campaign: Campaign,
+    group: TelegramGroup,
+    db: Session,
+):
     wrapper = TelegramClientWrapper(
         session_name=account.session_name,
         api_id=account.api_id,
@@ -33,142 +54,183 @@ async def worker_loop(account: TelegramAccount, db: Session):
     )
 
     variator = MessageVariator()
-    limiter = RateLimiter(
-        redis_client,
-        account_daily_limit=account.daily_message_limit,
-    )
 
     async with wrapper as client:
-        while True:
-            try:
-                # -------------------------
-                # DAILY COUNTER (DB)
-                # -------------------------
-                counter = (
-                    db.query(DailyCounter)
-                    .filter(DailyCounter.account_id == account.id)
-                    .first()
-                )
+        try:
+            final_message = variator.vary(campaign.message)
 
-                if not counter:
-                    counter = DailyCounter(account_id=account.id)
-                    db.add(counter)
-                    db.commit()
-                    db.refresh(counter)
+            await client.send_message(
+                entity=group.username or group.invite_link,
+                message=final_message,
+            )
 
-                counter.reset_if_needed()
-                db.commit()
+            account.last_used_at = datetime.now(timezone.utc)
 
-                # -------------------------
-                # APPLY WARMUP
-                # -------------------------
-                apply_warmup(account)
-                db.commit()
+            log = MessageLog(
+                campaign_id=campaign.id,
+                telegram_account_id=account.id,
+                telegram_group_id=group.id,
+                sent_at=datetime.now(timezone.utc),
+            )
 
-                # -------------------------
-                # ACCOUNT DAILY LIMIT
-                # -------------------------
-                rl = limiter.check_account_limit(str(account.id))
-                if not rl.allowed:
-                    logger.info(
-                        f"[{account.phone_number}] "
-                        f"Daily limit reached, sleeping {rl.retry_after}s"
-                    )
-                    await asyncio.sleep(rl.retry_after)
-                    continue
+            db.add(log)
+            db.commit()
 
-                # -------------------------
-                # GET NEXT CAMPAIGN TARGET
-                # -------------------------
-                target = get_next_campaign_target(db, account)
-                if not target:
-                    logger.debug("No eligible campaign target, sleeping 60s")
-                    await asyncio.sleep(60)
-                    continue
+            logger.success(
+                f"[{account.phone_number}] → {group.title}"
+            )
 
-                campaign = target["campaign"]
-                group = target["group"]
-                raw_message = target["message"]
+        except FloodWaitError as e:
+            logger.warning(
+                f"[{account.phone_number}] FloodWait {e.seconds}s"
+            )
+            await asyncio.sleep(e.seconds + 10)
 
-                # -------------------------
-                # GROUP COOLDOWN
-                # -------------------------
-                rl = limiter.check_group_cooldown(
-                    str(account.id),
-                    str(group.id),
-                )
-                if not rl.allowed:
-                    await asyncio.sleep(min(rl.retry_after, 300))
-                    continue
+        except RPCError:
+            logger.exception(
+                f"[{account.phone_number}] Telegram RPC error"
+            )
 
-                # -------------------------
-                # SEND MESSAGE
-                # -------------------------
-                final_message = variator.vary(raw_message)
-
-                await client.send_message(
-                    group.telegram_id,
-                    final_message,
-                )
-
-                limiter.increment_account(str(account.id))
-                limiter.mark_group_posted(
-                    str(account.id),
-                    str(group.id),
-                )
-
-                counter.count += 1
-                account.last_used_at = datetime.now(timezone.utc)
-
-                db.commit()
-
-                logger.success(
-                    f"[{account.phone_number}] "
-                    f"Sent to {group.name} ({counter.count}/{account.daily_message_limit})"
-                )
-
-                delay = random.randint(MIN_DELAY, MAX_DELAY)
-                await asyncio.sleep(delay)
-
-            except FloodWaitError as e:
-                logger.warning(
-                    f"[{account.phone_number}] FloodWait {e.seconds}s"
-                )
-                await asyncio.sleep(e.seconds + 15)
-
-            except RPCError:
-                logger.exception(
-                    f"[{account.phone_number}] Telegram RPC error"
-                )
-                await asyncio.sleep(300)
-
-            except Exception:
-                logger.exception(
-                    f"[{account.phone_number}] Worker crash recovered"
-                )
-                await asyncio.sleep(300)
+        except Exception:
+            logger.exception(
+                f"[{account.phone_number}] Unexpected error"
+            )
 
 
-async def main():
+# --------------------------------------------------
+# Campaign execution (single safe tick)
+# --------------------------------------------------
+
+async def run_campaign_once(campaign_id):
     db: Session = SessionLocal()
 
     try:
-        account = (
-            db.query(TelegramAccount)
-            .filter(TelegramAccount.status.in_(["warming", "active"]))
-            .order_by(TelegramAccount.created_at.asc())
+        campaign = (
+            db.query(Campaign)
+            .filter(Campaign.id == campaign_id)
             .first()
         )
 
-        if not account:
-            logger.error("No usable telegram accounts found")
+        if not campaign:
+            logger.error("Campaign not found")
             return
 
-        await worker_loop(account, db)
+        customer = campaign.customer
+
+        # --------------------------------------------------
+        # Pricing enforcement (interval only)
+        # --------------------------------------------------
+        validate_campaign_against_plan(
+            campaign=campaign,
+            plan_name=customer.subscription_tier,
+        )
+
+        plan = get_plan(customer.subscription_tier)
+
+        # --------------------------------------------------
+        # Campaign interval check (REDIS)
+        # --------------------------------------------------
+        if not campaign_interval_passed(
+            campaign_id=str(campaign.id),
+            interval_minutes=campaign.interval_minutes,
+        ):
+            logger.debug(
+                f"Campaign {campaign.id} still in cooldown"
+            )
+            return
+
+        # --------------------------------------------------
+        # Load dedicated Telegram accounts
+        # --------------------------------------------------
+        accounts = (
+            db.query(TelegramAccount)
+            .filter(
+                TelegramAccount.owner_customer_id == customer.id,
+                TelegramAccount.status.in_(["warming", "active"]),
+            )
+            .order_by(
+                TelegramAccount.last_used_at.asc().nullsfirst()
+            )
+            .limit(plan.accounts)
+            .all()
+        )
+
+        if not accounts:
+            logger.warning("No usable Telegram accounts")
+            return
+
+        # --------------------------------------------------
+        # Load campaign groups (markets)
+        # --------------------------------------------------
+        groups = (
+            db.query(TelegramGroup)
+            .join(CampaignGroup)
+            .filter(CampaignGroup.campaign_id == campaign.id)
+            .all()
+        )
+
+        if not groups:
+            logger.warning("Campaign has no target groups")
+            return
+
+        random.shuffle(groups)
+
+        # --------------------------------------------------
+        # Dispatch sends (SEQUENTIAL PER TICK — SAFE)
+        # --------------------------------------------------
+        for account in accounts:
+            # DAILY ACCOUNT LIMIT (REDIS)
+            if not can_send_message(
+                account_id=str(account.id),
+                daily_limit=plan.daily_messages_per_account,
+            ):
+                logger.info(
+                    f"Account {account.phone_number} exhausted for today"
+                )
+                continue
+
+            group = groups.pop(0) if groups else None
+            if not group:
+                break
+
+            apply_warmup(account)
+            db.commit()
+
+            try:
+                await send_with_account(
+                    account=account,
+                    campaign=campaign,
+                    group=group,
+                    db=db,
+                )
+
+                # --------------------------------------
+                # RECORD SUCCESS (REDIS)
+                # --------------------------------------
+                record_message_sent(
+                    account_id=str(account.id)
+                )
+                record_campaign_send(
+                    str(campaign.id)
+                )
+
+                account.last_used_at = datetime.now(timezone.utc)
+                db.commit()
+
+                logger.success(
+                    f"Campaign {campaign.id} → "
+                    f"{group.username} via {account.phone_number}"
+                )
+
+            except Exception:
+                logger.exception(
+                    f"Send failed for account {account.phone_number}"
+                )
+
+            # Randomized delay between sends
+            await asyncio.sleep(
+                random.randint(MIN_DELAY, MAX_DELAY)
+            )
 
     finally:
         db.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

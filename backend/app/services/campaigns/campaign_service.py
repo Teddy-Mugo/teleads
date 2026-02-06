@@ -1,117 +1,74 @@
-import asyncio
-from datetime import datetime, timezone
-
 from sqlalchemy.orm import Session
 
-from app.core.db import SessionLocal
-from app.models.models import Campaign, MessageLog
-from app.core.redis import redis_client
-from loguru import logger
+from app.models.models import Campaign, Customer, MarketList
+from app.services.pricing.enforcement import validate_campaign_against_plan
 
 
-# --------------------------------------------------
-# Campaign eligibility checks
-# --------------------------------------------------
-
-def campaign_is_due(campaign: Campaign) -> bool:
-    now = datetime.now(timezone.utc)
-
-    if campaign.status != "active":
-        return False
-
-    if campaign.start_at and now < campaign.start_at:
-        return False
-
-    if campaign.end_at and now > campaign.end_at:
-        return False
-
-    return True
-
-
-def campaign_interval_passed(
+def create_campaign(
     db: Session,
-    campaign: Campaign,
-) -> bool:
-    """
-    Checks if enough time has passed since last message.
-    """
-    last_message = (
-        db.query(MessageLog)
-        .filter(MessageLog.campaign_id == campaign.id)
-        .order_by(MessageLog.sent_at.desc())
-        .first()
+    customer: Customer,
+    data,
+) -> Campaign:
+    campaign = Campaign(
+        customer_id=customer.id,
+        name=data.name,
+        message=data.message,
+        interval_minutes=data.interval_minutes,
+        start_at=data.start_at,
+        end_at=data.end_at,
+        status="active",
     )
 
-    if not last_message:
-        return True
+    # 🔒 PRICING ENFORCEMENT (CORRECT LOCATION)
+    validate_campaign_against_plan(
+        campaign=campaign,
+        plan_name=customer.subscription_tier,
+    )
 
-    delta = datetime.now(timezone.utc) - last_message.sent_at
-    return delta.total_seconds() >= campaign.interval_minutes * 60
+    db.add(campaign)
+    db.commit()
+    db.refresh(campaign)
 
-
-# --------------------------------------------------
-# Redis lock (prevents duplicates)
-# --------------------------------------------------
-
-def acquire_campaign_lock(campaign_id: str) -> bool:
-    """
-    Ensures only one worker processes a campaign at a time.
-    """
-    key = f"campaign:lock:{campaign_id}"
-    return redis_client.set(key, "1", nx=True, ex=120)
+    return campaign
 
 
-def release_campaign_lock(campaign_id: str):
-    redis_client.delete(f"campaign:lock:{campaign_id}")
+def update_campaign(
+    db: Session,
+    campaign: Campaign,
+    customer: Customer,
+    updates: dict,
+) -> Campaign:
+    for key, value in updates.items():
+        setattr(campaign, key, value)
 
+    validate_campaign_against_plan(
+        campaign=campaign,
+        plan_name=customer.subscription_tier,
+    )
 
-# --------------------------------------------------
-# Scheduler loop
-# --------------------------------------------------
+    db.commit()
+    db.refresh(campaign)
 
-async def scheduler_loop():
-    logger.info("Campaign scheduler started")
+    return campaign
 
-    while True:
-        db = SessionLocal()
+def attach_market_lists_to_campaign(
+    *,
+    db: Session,
+    campaign,
+    market_list_ids: list,
+    customer_id,
+):
+    lists = (
+        db.query(MarketList)
+        .filter(
+            MarketList.id.in_(market_list_ids),
+            MarketList.customer_id == customer_id,
+        )
+        .all()
+    )
 
-        try:
-            campaigns = (
-                db.query(Campaign)
-                .filter(Campaign.status == "active")
-                .all()
-            )
+    if not lists:
+        raise ValueError("No valid market lists selected")
 
-            for campaign in campaigns:
-                if not campaign_is_due(campaign):
-                    continue
-
-                if not campaign_interval_passed(db, campaign):
-                    continue
-
-                if not acquire_campaign_lock(str(campaign.id)):
-                    continue  # already being processed
-
-                logger.info(f"Enqueuing campaign {campaign.id}")
-                asyncio.create_task(run_campaign(campaign.id))
-
-        except Exception:
-            logger.exception("Scheduler error")
-
-        finally:
-            db.close()
-
-        await asyncio.sleep(30)
-
-
-# --------------------------------------------------
-# Worker delegation
-# --------------------------------------------------
-
-async def run_campaign(campaign_id):
-    from app.workers.telegram_worker import run_campaign_once
-
-    try:
-        await run_campaign_once(campaign_id)
-    finally:
-        release_campaign_lock(str(campaign_id))
+    campaign.market_lists = lists
+    db.commit()

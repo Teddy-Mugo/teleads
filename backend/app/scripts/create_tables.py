@@ -1,5 +1,5 @@
 from app.core.db import engine, Base
-from app.models.models import SubscriptionPlan
+from app.models.models import SubscriptionPlan, MarketList, Customer, TelegramAccount, Campaign
 
 def main():
     print("ENGINE URL:", engine.url)

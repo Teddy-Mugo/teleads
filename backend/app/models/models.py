@@ -55,6 +55,11 @@ class Customer(Base):
 
     campaigns = relationship("Campaign", back_populates="customer")
     telegram_accounts = relationship("TelegramAccount", back_populates="owner")
+    market_lists = relationship(
+    "MarketList",
+    back_populates="customer",
+    cascade="all, delete-orphan",
+    )
 
 
 # -------------------------------------------------------------------
@@ -126,6 +131,12 @@ class TelegramGroup(Base):
         back_populates="group",
         cascade="all, delete-orphan",
     )
+    
+    market_lists = relationship(
+    "MarketList",
+    secondary="market_list_groups",
+    back_populates="groups",
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -172,6 +183,12 @@ class Campaign(Base):
         cascade="all, delete-orphan",
     )
     message_logs = relationship("MessageLog", back_populates="campaign")
+   
+    market_lists = relationship(
+    "MarketList",
+    secondary="campaign_market_lists",
+    back_populates="campaigns",
+    )
 
     __table_args__ = (
         CheckConstraint("campaign_type IN ('shared', 'dedicated')"),
@@ -361,3 +378,32 @@ class SubscriptionPlan(Base):
     group_cooldown_minutes = Column(Integer)
 
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# market lists
+
+class MarketList(Base):
+    __tablename__ = "market_lists"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    customer_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("customers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+
+    customer = relationship("Customer", back_populates="market_lists")
+
+    groups = relationship(
+        "TelegramGroup",
+        secondary="market_list_groups",
+        back_populates="market_lists",
+    )
+
+    campaigns = relationship(
+        "Campaign",
+        secondary="campaign_market_lists",
+        back_populates="market_lists",
+    )
